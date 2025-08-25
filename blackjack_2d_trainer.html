@@ -1,0 +1,517 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1" />
+<title>2D Blackjack + Card Counting Trainer</title>
+<style>
+  html, body { margin: 0; padding: 0; background: #0b5138; font-family: system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif; color: #fff; }
+  #app { display: flex; flex-direction: column; align-items: center; gap: 8px; padding: 12px; }
+  canvas { background: #127053; border-radius: 16px; box-shadow: 0 6px 18px rgba(0,0,0,0.45); touch-action: manipulation; }
+  #hud { width: 900px; max-width: 98vw; display: grid; grid-template-columns: repeat(3, 1fr); gap: 8px; align-items: center; }
+  #hud .box { background: rgba(0,0,0,0.25); padding: 8px 12px; border-radius: 12px; }
+  #hud .title { font-weight: 700; opacity: 0.85; font-size: 14px; }
+  #hud .value { font-variant-numeric: tabular-nums; font-size: 20px; }
+  #controls { display: flex; flex-wrap: wrap; gap: 8px; justify-content: center; }
+  button {
+    background: #f7f7f7; color: #0a0a0a; border: 0; padding: 10px 14px; border-radius: 10px;
+    font-weight: 700; cursor: pointer; transition: transform .06s ease, opacity .2s ease;
+  }
+  button:active { transform: translateY(1px) scale(0.99); }
+  button[disabled] { opacity: 0.45; cursor: not-allowed; }
+  .pill { border-radius: 999px; padding: 6px 10px; font-size: 12px; background: rgba(255,255,255,0.12); display: inline-block; margin-left: 6px; }
+  #log { width: 900px; max-width: 98vw; background: rgba(0,0,0,0.22); border-radius: 12px; padding: 8px 12px; max-height: 160px; overflow: auto; }
+  #footer { opacity: 0.8; font-size: 12px; }
+  a { color: #e2ffd6; }
+</style>
+</head>
+<body>
+  <div id="app">
+    <div id="hud">
+      <div class="box">
+        <div class="title">Shoe & Rules</div>
+        <div class="value"><span id="rulesLabel">6D · S17 · DAS</span> <span class="pill" id="penetration">Pen ~75%</span></div>
+      </div>
+      <div class="box">
+        <div class="title">Count (Hi‑Lo)</div>
+        <div class="value">RC <span id="rc">0</span> · TC <span id="tc">0.0</span></div>
+      </div>
+      <div class="box">
+        <div class="title">Session</div>
+        <div class="value">Hands <span id="hands">0</span> · W/L/P <span id="record">0/0/0</span></div>
+      </div>
+    </div>
+
+    <canvas id="game" width="900" height="600"></canvas>
+
+    <div id="controls">
+      <button id="btnDeal">Deal</button>
+      <button id="btnHit" disabled>Hit</button>
+      <button id="btnStand" disabled>Stand</button>
+      <button id="btnDouble" disabled>Double</button>
+      <button id="btnNewShoe">New Shoe</button>
+      <button id="btnToggleHints">Hints: Off</button>
+    </div>
+
+    <div id="log"></div>
+
+    <div id="footer">2D Blackjack Trainer: Hi‑Lo counting with true count, basic strategy hints, and a friendly single-player flow. For home/educational use.</div>
+  </div>
+
+<script>
+// ======= Utility =======
+const randInt = (n) => Math.floor(Math.random() * n);
+
+function shuffle(array) {
+  for (let i = array.length - 1; i > 0; i--) {
+    const j = Math.floor(Math.random() * (i + 1));
+    [array[i], array[j]] = [array[j], array[i]];
+  }
+  return array;
+}
+
+// ======= Card / Shoe =======
+const RANKS = ["A","2","3","4","5","6","7","8","9","10","J","Q","K"];
+const SUITS = ["♠","♥","♦","♣"];
+const HI_LO = { "2":1,"3":1,"4":1,"5":1,"6":1,"7":0,"8":0,"9":0,"10":-1,"J":-1,"Q":-1,"K":-1,"A":-1 };
+
+function makeShoe(decks=6) {
+  const cards = [];
+  for (let d=0; d<decks; d++) {
+    for (const r of RANKS) for (const s of SUITS) cards.push({r, s});
+  }
+  return shuffle(cards);
+}
+
+// ======= Hand value =======
+function handValue(hand) {
+  // returns { total, soft }
+  let total = 0;
+  let aces = 0;
+  for (const c of hand) {
+    if (c.r === "A") { aces++; total += 11; }
+    else if (["10","J","Q","K"].includes(c.r)) total += 10;
+    else total += parseInt(c.r, 10);
+  }
+  let soft = false;
+  while (total > 21 && aces > 0) { total -= 10; aces--; }
+  if (aces > 0) soft = (total + 10) <= 21; // if we could treat one Ace as 11
+  return { total, soft };
+}
+
+function isBlackjack(hand) {
+  return hand.length === 2 && handValue(hand).total === 21;
+}
+
+// ======= Strategy Hints (S17, DAS, no surrender, single-hand) =======
+// Simplified basic strategy for training; covers most common spots.
+function basicHint(player, dealerUp) {
+  // Returns "Hit", "Stand", "Double", or "" if no clear hint (e.g., after 3+ cards, we avoid Double hint)
+  const pVal = handValue(player);
+  const d = dealerUpCardValue(dealerUp);
+  const isPair = (player.length === 2 && player[0].r === player[1].r);
+  const firstTwo = (player.length === 2);
+
+  // Pairs
+  if (isPair) {
+    const r = player[0].r;
+    if (r === "A" || r === "8") return "Split (not implemented)";
+    if (r === "9") return ( [2,3,4,5,6,8,9].includes(d) ? "Split (not implemented)" : "Stand" );
+    if (r === "7") return (d <= 7 ? "Hit/Consider Split" : "Hit");
+    if (r === "6") return (d <= 6 ? "Hit/Consider Split" : "Hit");
+    if (r === "2" || r === "3") return (d <= 7 ? "Hit/Consider Split" : "Hit");
+    if (r === "4") return (d === 5 || d === 6 ? "Hit/Consider Split" : "Hit");
+    if (r === "5") { /* treat like 10 */ }
+  }
+
+  // Soft hands (A + something)
+  if (pVal.soft && pVal.total >= 13 && pVal.total <= 20) {
+    // Soft totals
+    if (pVal.total <= 17) {
+      if (firstTwo && (d === 4 || d === 5 || d === 6)) return "Double";
+      return "Hit";
+    }
+    if (pVal.total === 18) {
+      if (firstTwo && (d === 2 || d === 3 || d === 4 || d === 5 || d === 6)) return "Double";
+      if ([7,8].includes(d)) return "Stand";
+      return "Hit";
+    }
+    if (pVal.total >= 19) return "Stand";
+  }
+
+  // Hard hands
+  const t = pVal.total;
+  if (t <= 8) return "Hit";
+  if (t === 9) return (firstTwo && d >= 3 && d <= 6) ? "Double" : "Hit";
+  if (t === 10) return (firstTwo && d <= 9) ? "Double" : "Hit";
+  if (t === 11) return firstTwo ? "Double" : "Hit";
+  if (t === 12) return (d >= 4 && d <= 6) ? "Stand" : "Hit";
+  if (t >= 13 && t <= 16) return (d <= 6) ? "Stand" : "Hit";
+  return "Stand";
+}
+
+function dealerUpCardValue(card) {
+  if (!card) return 0;
+  if (card.r === "A") return 11;
+  if (["10","J","Q","K"].includes(card.r)) return 10;
+  return parseInt(card.r, 10);
+}
+
+// ======= Game State =======
+const GameState = {
+  Idle: "Idle",
+  PlayerTurn: "PlayerTurn",
+  DealerTurn: "DealerTurn",
+  RoundOver: "RoundOver"
+};
+
+const state = {
+  shoe: [],
+  discard: [],
+  runningCount: 0,
+  trueCount: 0,
+  decks: 6,
+  penetration: 0.75,
+  handsPlayed: 0,
+  wins: 0, losses: 0, pushes: 0,
+  player: [], dealer: [],
+  betUnit: 10,
+  bankroll: 1000,
+  canDouble: false,
+  game: GameState.Idle,
+  hintsOn: false,
+  revealDealerHole: false
+};
+
+function resetShoe() {
+  state.shoe = makeShoe(state.decks);
+  state.discard = [];
+  state.runningCount = 0;
+  state.trueCount = 0;
+  state.handsPlayed = 0;
+  state.wins = 0; state.losses = 0; state.pushes = 0;
+  logMsg("New 6-deck shoe created. Good luck!");
+  updateHUD();
+}
+
+function cardsLeftDecks() {
+  return Math.max(0.25, state.shoe.length / 52);
+}
+
+function dealOne(to) {
+  if (state.shoe.length === 0) {
+    resetShoe();
+  }
+  const c = state.shoe.pop();
+  to.push(c);
+  // Update count
+  const v = HI_LO[c.r] ?? 0;
+  state.runningCount += v;
+  state.trueCount = state.runningCount / cardsLeftDecks();
+  return c;
+}
+
+function startRound() {
+  // Check penetration; if exceeded, reshuffle
+  const used = state.decks*52 - state.shoe.length;
+  const penLimit = Math.floor(state.decks*52 * state.penetration);
+  if (used > penLimit) {
+    logMsg("Reached penetration threshold. Reshuffling...");
+    resetShoe();
+  }
+
+  state.player = [];
+  state.dealer = [];
+  state.revealDealerHole = false;
+  dealOne(state.player);
+  const up = dealOne(state.dealer);
+  dealOne(state.player);
+  const hole = dealOne(state.dealer);
+  state.canDouble = true;
+  state.game = GameState.PlayerTurn;
+
+  // Natural checks
+  if (isBlackjack(state.player) || isBlackjack(state.dealer)) {
+    state.revealDealerHole = true;
+    state.game = GameState.RoundOver;
+    settle();
+  } else {
+    logMsg(`New hand. Dealer shows ${up.r}${up.s}.`);
+  }
+  updateHUD();
+  draw();
+}
+
+function hit() {
+  if (state.game !== GameState.PlayerTurn) return;
+  dealOne(state.player);
+  state.canDouble = false;
+  const p = handValue(state.player);
+  if (p.total > 21) {
+    state.game = GameState.RoundOver;
+    state.revealDealerHole = true;
+    settle();
+  }
+  updateHUD();
+  draw();
+}
+
+function stand() {
+  if (state.game !== GameState.PlayerTurn) return;
+  state.game = GameState.DealerTurn;
+  dealerPlay();
+}
+
+function doubleDown() {
+  if (state.game !== GameState.PlayerTurn || !state.canDouble) return;
+  // Simple: double bet resolution inside settle; here we just mark and hit exactly one card, then stand.
+  dealOne(state.player);
+  state.player._doubled = true;
+  state.canDouble = false;
+  const p = handValue(state.player);
+  if (p.total > 21) {
+    state.game = GameState.RoundOver;
+    state.revealDealerHole = true;
+    settle();
+  } else {
+    stand();
+  }
+}
+
+function dealerPlay() {
+  state.revealDealerHole = true;
+  // Dealer stands on all 17 (S17). Dealer hits <17 or soft 16, etc.
+  let dv = handValue(state.dealer);
+  while (dv.total < 17 || (dv.total === 17 && dv.soft === true && false /* set to true for H17 */)) {
+    dealOne(state.dealer);
+    dv = handValue(state.dealer);
+  }
+  state.game = GameState.RoundOver;
+  settle();
+}
+
+function settle() {
+  const pv = handValue(state.player).total;
+  const dv = handValue(state.dealer).total;
+  let outcome = "";
+  let unit = state.betUnit;
+  if (state.player._doubled) unit *= 2;
+
+  if (isBlackjack(state.player) && !isBlackjack(state.dealer)) {
+    outcome = "Blackjack! You win 3:2";
+    state.bankroll += unit * 1.5;
+    state.wins++;
+  } else if (pv > 21) {
+    outcome = "You bust. Dealer wins.";
+    state.bankroll -= unit;
+    state.losses++;
+  } else if (dv > 21) {
+    outcome = "Dealer busts. You win!";
+    state.bankroll += unit;
+    state.wins++;
+  } else if (pv > dv) {
+    outcome = "You win!";
+    state.bankroll += unit;
+    state.wins++;
+  } else if (pv < dv) {
+    outcome = "Dealer wins.";
+    state.bankroll -= unit;
+    state.losses++;
+  } else {
+    outcome = "Push.";
+    state.pushes++;
+  }
+  state.handsPlayed++;
+  logMsg(outcome);
+  updateHUD();
+  draw();
+}
+
+// ======= Rendering =======
+const canvas = document.getElementById("game");
+const ctx = canvas.getContext("2d");
+
+function drawTable() {
+  ctx.clearRect(0,0,canvas.width, canvas.height);
+  // Felt gradient
+  const g = ctx.createRadialGradient(canvas.width/2, canvas.height*0.3, 50, canvas.width/2, canvas.height*0.3, 700);
+  g.addColorStop(0, "#148565");
+  g.addColorStop(1, "#0f5e47");
+  ctx.fillStyle = g;
+  ctx.fillRect(0,0,canvas.width, canvas.height);
+
+  // Center line arc
+  ctx.strokeStyle = "rgba(255,255,255,0.15)";
+  ctx.lineWidth = 2;
+  ctx.beginPath();
+  ctx.ellipse(canvas.width/2, canvas.height*0.62, 420, 220, 0, Math.PI, 0);
+  ctx.stroke();
+
+  // Labels
+  ctx.fillStyle = "rgba(255,255,255,0.85)";
+  ctx.font = "16px system-ui, sans-serif";
+  ctx.textAlign = "center";
+  ctx.fillText("Dealer", canvas.width/2, 40);
+  ctx.fillText("Player", canvas.width/2, 360);
+}
+
+function drawCard(x,y,w,h, card, faceUp=true) {
+  ctx.save();
+  // Shadow
+  ctx.shadowColor = "rgba(0,0,0,0.35)";
+  ctx.shadowBlur = 8;
+  ctx.shadowOffsetY = 3;
+
+  // Card
+  const r = 10;
+  ctx.fillStyle = faceUp ? "#ffffff" : "#c12b3a";
+  ctx.beginPath();
+  roundRect(ctx, x,y,w,h,r);
+  ctx.fill();
+
+  // Border
+  ctx.strokeStyle = "rgba(0,0,0,0.2)";
+  ctx.lineWidth = 1;
+  ctx.stroke();
+
+  if (faceUp) {
+    const color = (card.s === "♥" || card.s === "♦") ? "#c21b2c" : "#121212";
+    ctx.fillStyle = color;
+    ctx.font = "20px system-ui, sans-serif";
+    ctx.textAlign = "left";
+    ctx.fillText(card.r, x+10, y+24);
+    ctx.fillText(card.s, x+10, y+45);
+
+    ctx.textAlign = "right";
+    ctx.fillText(card.r, x+w-10, y+h-12);
+    ctx.fillText(card.s, x+w-10, y+h-33);
+
+    // Big suit
+    ctx.textAlign = "center";
+    ctx.font = "36px system-ui, sans-serif";
+    ctx.fillText(card.s, x+w/2, y+h/2+12);
+  }
+  ctx.restore();
+}
+
+function roundRect(ctx, x, y, w, h, r) {
+  ctx.beginPath();
+  ctx.moveTo(x+r, y);
+  ctx.arcTo(x+w, y, x+w, y+h, r);
+  ctx.arcTo(x+w, y+h, x, y+h, r);
+  ctx.arcTo(x, y+h, x, y, r);
+  ctx.arcTo(x, y, x+w, y, r);
+  ctx.closePath();
+}
+
+function drawHands() {
+  const dealerY = 70;
+  const playerY = 390;
+  const startX = canvas.width/2 - 140;
+  const cardW = 90, cardH = 130, gap = 24;
+
+  // Dealer
+  state.dealer.forEach((c, i) => {
+    const x = startX + i*(cardW+gap);
+    const faceUp = (i !== 1) || state.revealDealerHole;
+    drawCard(x, dealerY, cardW, cardH, c, faceUp);
+  });
+
+  // Player
+  state.player.forEach((c, i) => {
+    const x = startX + i*(cardW+gap);
+    drawCard(x, playerY, cardW, cardH, c, true);
+  });
+
+  // Totals
+  ctx.fillStyle = "#fff";
+  ctx.font = "18px system-ui, sans-serif";
+  ctx.textAlign = "left";
+  const dv = state.revealDealerHole ? handValue(state.dealer).total : dealerUpCardValue(state.dealer[0]);
+  ctx.fillText(`Dealer: ${dv}`, 20, dealerY + 20);
+  const pv = handValue(state.player);
+  ctx.fillText(`You: ${pv.total}${pv.soft ? " (soft)":""}`, 20, playerY + 20);
+
+  // Hints
+  if (state.hintsOn && state.game === GameState.PlayerTurn && state.player.length > 0) {
+    const hint = basicHint(state.player, state.dealer[0]);
+    if (hint) {
+      ctx.textAlign = "center";
+      ctx.font = "22px system-ui, sans-serif";
+      ctx.fillStyle = "rgba(255,255,255,0.95)";
+      ctx.fillText(`Hint: ${hint}`, canvas.width/2, playerY - 24);
+    }
+  }
+}
+
+function drawBetInfo() {
+  ctx.fillStyle = "rgba(255,255,255,0.9)";
+  ctx.font = "16px system-ui, sans-serif";
+  ctx.textAlign = "right";
+  ctx.fillText(`Bankroll: $${state.bankroll.toFixed(0)}  ·  Bet: $${(state.player._doubled ? state.betUnit*2 : state.betUnit).toFixed(0)}`, canvas.width - 16, canvas.height - 16);
+
+  // Count overlay
+  ctx.textAlign = "left";
+  ctx.fillText(`RC ${state.runningCount.toFixed(0)}  ·  TC ${state.trueCount.toFixed(2)}  ·  Decks Left ~ ${cardsLeftDecks().toFixed(1)}`, 16, canvas.height - 16);
+}
+
+function draw() {
+  drawTable();
+  drawHands();
+  drawBetInfo();
+}
+
+// ======= DOM / HUD =======
+const rcEl = document.getElementById("rc");
+const tcEl = document.getElementById("tc");
+const handsEl = document.getElementById("hands");
+const recordEl = document.getElementById("record");
+const logEl = document.getElementById("log");
+const btnDeal = document.getElementById("btnDeal");
+const btnHit = document.getElementById("btnHit");
+const btnStand = document.getElementById("btnStand");
+const btnDouble = document.getElementById("btnDouble");
+const btnNewShoe = document.getElementById("btnNewShoe");
+const btnToggleHints = document.getElementById("btnToggleHints");
+
+function updateHUD() {
+  rcEl.textContent = state.runningCount.toFixed(0);
+  tcEl.textContent = state.trueCount.toFixed(1);
+  handsEl.textContent = state.handsPlayed;
+  recordEl.textContent = `${state.wins}/${state.losses}/${state.pushes}`;
+
+  btnDeal.disabled = !(state.game === GameState.Idle || state.game === GameState.RoundOver);
+  btnHit.disabled = !(state.game === GameState.PlayerTurn);
+  btnStand.disabled = !(state.game === GameState.PlayerTurn);
+  btnDouble.disabled = !(state.game === GameState.PlayerTurn && state.canDouble);
+}
+
+function logMsg(msg) {
+  const time = new Date().toLocaleTimeString();
+  const line = document.createElement("div");
+  line.textContent = `[${time}] ${msg}`;
+  logEl.prepend(line);
+}
+
+// ======= Events =======
+btnDeal.addEventListener("click", () => {
+  state.player._doubled = false;
+  startRound();
+});
+btnHit.addEventListener("click", hit);
+btnStand.addEventListener("click", stand);
+btnDouble.addEventListener("click", doubleDown);
+btnNewShoe.addEventListener("click", resetShoe);
+btnToggleHints.addEventListener("click", () => {
+  state.hintsOn = !state.hintsOn;
+  btnToggleHints.textContent = `Hints: ${state.hintsOn ? "On" : "Off"}`;
+  draw();
+});
+
+// ======= Boot =======
+resetShoe();
+draw();
+</script>
+
+</body>
+</html>
